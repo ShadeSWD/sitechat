@@ -49,9 +49,11 @@ dir: "min" — чем меньше, тем лучше (стоимость, ра�
 «Произвольные данные» на странице ввести.
 Иначе — обычный {"type":"chat","answer":"..."}.""",
     'tracks': """
-Отвечай по СПИСКУ ТРЕКОВ из справки: ищи конкретные поездки по названию,
-сравнивай годы и километраж, советуй, куда поехать, опираясь на то, где
-пользователь уже был (или явно не был). {"type":"chat","answer":"..."}""",
+Отвечай по СПИСКУ ТРЕКОВ из справки. Если в справке есть строка
+«ГОТОВЫЙ ФАКТ» — это точный, уже посчитанный ответ на вопрос: назови ЕГО числа
+дословно (не пересчитывай и не выдумывай свои). Ищи конкретные поездки по
+названию, сравнивай годы и километраж, советуй, куда поехать, опираясь на то,
+где пользователь уже был. {"type":"chat","answer":"..."}""",
 }
 
 SYSTEM = """Ты — дружелюбный помощник сайта. Отвечай кратко (2-5 предложений),
@@ -109,32 +111,147 @@ def build_relmet_link(task):
     return RELMET_BASE + '/express/?d=' + payload
 
 
+# категории tracks.json и слова, которыми их называют в вопросах
+TRACK_CATS = {
+    'other': ('EUC (моноколесо)', ['euc', 'моноколес', 'моноколёс', 'колес', 'колёс']),
+    'bicycle': ('Велосипед', ['вело', 'велик', 'велосипед', 'bike', 'bicycle']),
+    'water': ('SUP/каяк', ['sup', 'сап', 'сапборд', 'каяк', 'kayak', 'греб']),
+    'windsurf': ('Виндсерф/wing', ['виндсерф', 'винг', 'windsurf', 'parawing', 'катамаран']),
+    'hike': ('Пешком', ['пешком', 'пеших', 'пешие', 'hike', 'поход', 'прогулк']),
+    'ski': ('Лыжи', ['лыж', 'ski']),
+    'nordic': ('Коньки', ['коньк', 'nordic']),
+    'paraglide': ('Параплан', ['параплан', 'paraglid']),
+    'quad': ('Квадро/эндуро/снегоход', ['квадр', 'эндуро', 'снегоход', 'питбайк', 'atv']),
+    'motoboat': ('Мотолодка/гидроцикл', ['мотолодк', 'гидроцикл', 'моторк', 'jetski']),
+    'yacht': ('Яхта', ['яхт', 'yacht']),
+    'horse': ('Конные', ['конн', 'лошад', 'horse']),
+    'bmw': ('Авто (BMW)', ['бмв', 'bmw', 'машин', 'авто ']),
+    'rv': ('Автодом', ['автодом', 'кемпер', 'camper', ' rv']),
+    'train': ('Поезд', ['поезд', 'поезда']),
+    'suburban': ('Электричка', ['электричк', 'ласточк']),
+    'flight': ('Самолёт', ['самолёт', 'самолет', 'перелёт', 'перелет', 'рейс']),
+    'ferry': ('Паром/теплоход', ['паром', 'теплоход', 'метеор', 'катер', 'круиз']),
+    'cable': ('Канатки/фуникулёры', ['канатк', 'фуникул', 'подъёмник', 'подъемник']),
+    'diveboat': ('Дайв-бот', ['дайв-бот', 'дайвбот']),
+}
+ACT_WORDS = {'skydives': ['прыж', 'парашют', 'skydiv'], 'dives': ['дайв', 'погружен', 'scuba'],
+             'tunnelMinutes': ['труб', 'tunnel', 'аэродинамич'], 'ropejumps': ['роуп', 'rope'],
+             'paraglides': ['параплан']}
+
+
 def tracks_context(message):
-    """Компактная выжимка треков: агрегаты + совпадения по словам вопроса."""
+    """Выжимка под вопрос: точные агрегаты считает КОД, модель их пересказывает.
+    Понимает категории по синонимам, подстроки в именах (MixWheels, город...),
+    годы и активности из логбука."""
     try:
         with open(TRACKS_JSON, encoding='utf-8') as fh:
             tracks = json.load(fh).get('tracks', [])
     except (OSError, ValueError):
         return ''
+    msg = message.lower()
+    lines = []
     by_year = {}
     for t in tracks:
         y = t.get('y')
         by_year.setdefault(y, [0, 0.0])
         by_year[y][0] += 1
         by_year[y][1] += t.get('km') or 0
-    lines = ['Всего треков: %d. По годам (поездок, км): ' % len(tracks) +
-             '; '.join(f'{y}: {n}, {km:.0f} км'
-                       for y, (n, km) in sorted(by_year.items()) if y)]
-    words = [w.lower().strip('.,!?')[:5] for w in message.split()
-             if len(w.strip('.,!?')) > 3][:8]
-    hits = [t for t in tracks
-            if any(w in (t.get('n') or '').lower() for w in words)][:25]
-    sample = hits if hits else sorted(
-        tracks, key=lambda t: t.get('km') or 0, reverse=True)[:15]
-    label = 'Найдено по вопросу' if hits else 'Самые длинные поездки'
-    lines.append(label + ':')
-    lines += [f"- {t.get('n')} ({t.get('km')} км)" for t in sample]
-    return '\n'.join(lines)[:5000]
+    lines.append('Всего треков: %d, суммарно %.0f км. По годам: ' %
+                 (len(tracks), sum(v[1] for v in by_year.values())) +
+                 '; '.join(f'{y}: {n} шт, {km:.0f} км'
+                           for y, (n, km) in sorted(by_year.items()) if y))
+    # фильтры из вопроса
+    import re as _re
+    sel = tracks
+    desc = []
+    cats = [c for c, (_, syns) in TRACK_CATS.items() if any(s in msg for s in syns)]
+    if cats:
+        sel = [t for t in sel if t.get('c') in cats]
+        desc.append('категория ' + '/'.join(TRACK_CATS[c][0] for c in cats))
+    years = [int(y) for y in _re.findall(r'\b(20\d\d)\b', msg)]
+    if years:
+        sel = [t for t in sel if t.get('y') in years]
+        desc.append('год ' + '/'.join(map(str, years)))
+    # слова-подстроки для поиска по именам (латиница и «содержательные» русские)
+    stop = {'сколько', 'какой', 'какая', 'какие', 'когда', 'где', 'самый', 'самая',
+            'всего', 'проехала', 'проехал', 'ездила', 'ездил', 'была', 'быть',
+            'треки', 'трек', 'поездки', 'поездка', 'этом', 'году', 'меня', 'мной'}
+    used = {s for c in cats for s in TRACK_CATS[c][1]}
+    words = []
+    for w in _re.findall(r'[a-zA-Zа-яёА-ЯЁ][\w-]{2,}', message):
+        wl = w.lower()
+        if wl in stop or any(wl.startswith(u) or u.startswith(wl) for u in used):
+            continue
+        words.append(wl)
+    name_hits = []
+    if words:
+        name_hits = [t for t in sel
+                     if all(w in (t.get('n') or '').lower() for w in words[:4])]
+        if not name_hits:
+            name_hits = [t for t in sel
+                         if any(w in (t.get('n') or '').lower() for w in words[:4])]
+        if name_hits:
+            sel = name_hits
+            desc.append('в названии: ' + ', '.join(words[:4]))
+    if desc:
+        km_sel = sum(t.get('km') or 0 for t in sel)
+        y_sel = {}
+        for t in sel:
+            y_sel.setdefault(t.get('y'), [0, 0.0])
+            y_sel[t.get('y')][0] += 1
+            y_sel[t.get('y')][1] += t.get('km') or 0
+        lines.append('ГОТОВЫЙ ФАКТ (использовать как ответ): по фильтру «%s» — '
+                     '%d трек(ов), суммарно %.1f км.' % ('; '.join(desc), len(sel), km_sel))
+        if len(y_sel) > 1:
+            lines.append('Из них по годам: ' + '; '.join(
+                f'{y}: {n} шт, {km:.0f} км' for y, (n, km) in sorted(y_sel.items()) if y))
+        top = sorted(sel, key=lambda t: t.get('km') or 0, reverse=True)[:10]
+        lines.append('Примеры (самые длинные из найденных):')
+        lines += [f"- {t.get('n')} ({t.get('km'):.0f} км)" for t in top]
+    else:
+        top = sorted(tracks, key=lambda t: t.get('km') or 0, reverse=True)[:10]
+        lines.append('Самые длинные поездки:')
+        lines += [f"- {t.get('n')} ({t.get('km'):.0f} км)" for t in top]
+    # активности из логбука, если спрашивают про них
+    if any(s in msg for ws in ACT_WORDS.values() for s in ws):
+        try:
+            with open(os.path.join(os.path.dirname(TRACKS_JSON), 'activities.json'),
+                      encoding='utf-8') as fh:
+                a = json.load(fh)
+            lines.append('Логбук активностей: прыжков с парашютом %s (за 365 дней %s), '
+                         'дайвов %s, аэротрубы %d мин, роупджампов %s, парапланов %s.' % (
+                             a.get('skydives'), a.get('skydives365'), a.get('dives'),
+                             round(a.get('tunnelMinutes') or 0), a.get('ropejumps'),
+                             a.get('paraglides')))
+        except (OSError, ValueError):
+            pass
+    # страны/регионы, если спрашивают
+    if any(s in msg for s in ('стран', 'регион', 'росси', 'мир', 'посет', 'был')):
+        try:
+            with open(os.path.join(os.path.dirname(TRACKS_JSON), 'visits.json'),
+                      encoding='utf-8') as fh:
+                v = json.load(fh)
+            cs = v.get('countries') or []
+            rr = v.get('ruRegions') or []
+            lines.append('Стран посещено: %d (%s). Регионов России: %d (%s).' % (
+                len(cs), ', '.join(c['name'] for c in cs[:40]),
+                len(rr), ', '.join(r['name'] for r in rr[:45])))
+        except (OSError, ValueError):
+            pass
+    # планы поездок — для советов «куда съездить»
+    if any(s in msg for s in ('куда', 'совет', 'план', 'предлож', 'выходн', 'поехать',
+                              'съездить', 'маршрут', 'идеи', 'новое')):
+        try:
+            with open(TRACKS_JSON, encoding='utf-8') as fh:
+                routes = json.load(fh).get('routes', [])
+            if routes:
+                lines.append('ГОТОВЫЕ ПЛАНЫ МАРШРУТОВ на сайте (слой «План мира» и '
+                             'секция «Планы»), их можно предлагать: ' +
+                             '; '.join('%s (%.0f км)' % (r.get('n', '').replace('_', ' '),
+                                                         r.get('km') or 0) for r in routes))
+        except (OSError, ValueError):
+            pass
+    return '\n'.join(lines)[:7000]
 
 
 def load_knowledge(site):
@@ -164,7 +281,9 @@ def ask_llm(system, history, message, timeout=180):
     messages.append({'role': 'user', 'content': message})
     payload = json.dumps({'model': MODEL, 'stream': False, 'format': 'json',
                           'messages': messages,
-                          'options': {'temperature': 0.4, 'num_predict': 600}}).encode()
+                          # num_ctx: дефолтные 2048 обрезали справку — модель «не видела» данных
+                          'options': {'temperature': 0.4, 'num_predict': 600,
+                                      'num_ctx': 8192}}).encode()
     req = urllib.request.Request(OLLAMA.rstrip('/') + '/api/chat', data=payload,
                                  headers={'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -214,12 +333,18 @@ def chat():
                             'link_text': 'Открыть задачу в экспресс-анализе →'})
             except Exception:
                 pass
+    tr_ctx = ''
     if site == 'tracks':
-        knowledge = knowledge + '\n\nСПИСОК ТРЕКОВ:\n' + tracks_context(message)
+        tr_ctx = tracks_context(message)
+        knowledge = knowledge + '\n\nСПИСОК ТРЕКОВ:\n' + tr_ctx
     system = SYSTEM.format(knowledge=knowledge, skill=SKILLS.get(site, ''))
     try:
         raw = ask_llm(system, history, message)
     except Exception:
+        # модель лежит, но точный факт уже посчитан кодом — отдаём его напрямую
+        fact = next((l for l in tr_ctx.split('\n') if l.startswith('ГОТОВЫЙ ФАКТ')), '')
+        if fact:
+            return jsonify({'answer': fact.replace('ГОТОВЫЙ ФАКТ (использовать как ответ): ', '')})
         return jsonify({'error': 'Помощник сейчас недоступен, попробуйте позже.'}), 503
 
     try:
