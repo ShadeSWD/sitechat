@@ -67,6 +67,14 @@
       body: JSON.stringify({site: SITE, message: text, history: history})
     }).then(function (r) { return r.json(); }).then(function (d) {
       wait.textContent = d.answer || d.error || 'что-то пошло не так';
+      if (d.link) {
+        var a = document.createElement('a');
+        a.href = d.link; a.target = '_blank'; a.rel = 'noopener';
+        a.textContent = d.link_text || 'Открыть →';
+        a.style.cssText = 'display:block;margin-top:6px;font-weight:600';
+        wait.appendChild(document.createElement('br'));
+        wait.appendChild(a);
+      }
       if (d.answer) {
         history.push({role: 'user', text: text});
         history.push({role: 'assistant', text: d.answer});
