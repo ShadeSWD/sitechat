@@ -10,6 +10,8 @@
 """
 import json
 import os
+import shutil
+import subprocess
 import time
 import urllib.request
 from collections import defaultdict, deque
@@ -20,6 +22,8 @@ app = Flask(__name__)
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OLLAMA = os.environ.get('SITECHAT_OLLAMA', 'http://127.0.0.1:11434')
 MODEL = os.environ.get('SITECHAT_MODEL', 'qwen2.5:3b')
+CLAUDE_BIN = shutil.which('claude') or '/root/.local/bin/claude'
+CLAUDE_MODEL = os.environ.get('SITECHAT_CLAUDE_MODEL', 'claude-haiku-4-5-20251001')
 RATE_PER_MIN = int(os.environ.get('SITECHAT_RATE', '6'))
 _hits = defaultdict(deque)
 
@@ -301,20 +305,43 @@ def rate_ok(ip):
 
 
 def ask_llm(system, history, message, timeout=180):
-    messages = [{'role': 'system', 'content': system}]
+    """LLM-вызов: Claude Haiku через локальный CLI `claude -p` (подписка
+    Claude Code хозяина сервера). Ollama с сервера убрана по требованию
+    владельца — локальная модель занимала память и своп; переменная
+    SITECHAT_OLLAMA оставлена как явный путь отката."""
+    if os.environ.get('SITECHAT_BACKEND') == 'ollama':
+        messages = [{'role': 'system', 'content': system}]
+        for h in history[-6:]:
+            role = 'assistant' if h.get('role') == 'assistant' else 'user'
+            messages.append({'role': role, 'content': str(h.get('text', ''))[:1000]})
+        messages.append({'role': 'user', 'content': message})
+        payload = json.dumps({'model': MODEL, 'stream': False, 'format': 'json',
+                              'messages': messages,
+                              'options': {'temperature': 0.4, 'num_predict': 600,
+                                          'num_ctx': 8192}}).encode()
+        req = urllib.request.Request(OLLAMA.rstrip('/') + '/api/chat', data=payload,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())['message']['content'].strip()
+    parts = [system, '', 'ДИАЛОГ ДО ЭТОГО:']
     for h in history[-6:]:
-        role = 'assistant' if h.get('role') == 'assistant' else 'user'
-        messages.append({'role': role, 'content': str(h.get('text', ''))[:1000]})
-    messages.append({'role': 'user', 'content': message})
-    payload = json.dumps({'model': MODEL, 'stream': False, 'format': 'json',
-                          'messages': messages,
-                          # num_ctx: дефолтные 2048 обрезали справку — модель «не видела» данных
-                          'options': {'temperature': 0.4, 'num_predict': 600,
-                                      'num_ctx': 8192}}).encode()
-    req = urllib.request.Request(OLLAMA.rstrip('/') + '/api/chat', data=payload,
-                                 headers={'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())['message']['content'].strip()
+        who = 'Помощник' if h.get('role') == 'assistant' else 'Пользователь'
+        parts.append(who + ': ' + str(h.get('text', ''))[:1000])
+    parts += ['', 'Пользователь: ' + message, '',
+              'Ответь СТРОГО одним JSON-объектом по правилам выше, без пояснений вокруг.']
+    env = dict(os.environ)
+    env.setdefault('HOME', '/root')
+    r = subprocess.run(
+        [CLAUDE_BIN, '--model', CLAUDE_MODEL, '-p'],
+        input='\n'.join(parts).encode(), capture_output=True, timeout=timeout, env=env)
+    if r.returncode != 0:
+        raise RuntimeError('claude cli: ' + r.stderr.decode()[:200])
+    text = r.stdout.decode().strip()
+    # модель любит заворачивать JSON в ```‑ограду — срезаем до чистого объекта
+    if text.startswith('```'):
+        text = text.split('\n', 1)[-1]
+        text = text.rsplit('```', 1)[0].strip()
+    return text
 
 
 @app.route('/chat', methods=['POST'])
