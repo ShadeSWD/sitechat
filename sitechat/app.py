@@ -50,8 +50,8 @@ dir: "min" — чем меньше, тем лучше (стоимость, ра�
 Иначе — обычный {"type":"chat","answer":"..."}.""",
     'tracks': """
 Отвечай по СПИСКУ ТРЕКОВ из справки. Если в справке есть строка
-«ГОТОВЫЙ ФАКТ» — это точный, уже посчитанный ответ на вопрос: назови ЕГО числа
-дословно (не пересчитывай и не выдумывай свои). Ищи конкретные поездки по
+«ФАКТ ДЛЯ ОТВЕТА» — это точный посчитанный ответ: перескажи его живой фразой,
+числа бери ровно оттуда, ничего не пересчитывай и не добавляй лишних поездок. Ищи конкретные поездки по
 названию, сравнивай годы и километраж, советуй, куда поехать, опираясь на то,
 где пользователь уже был. {"type":"chat","answer":"..."}""",
 }
@@ -164,7 +164,11 @@ def tracks_context(message):
     import re as _re
     sel = tracks
     desc = []
-    cats = [c for c, (_, syns) in TRACK_CATS.items() if any(s in msg for s in syns)]
+    # из текста для матчинга категорий вырезаем «вопросные» слова: «поездки»
+    # содержит «поезд» и раньше ловило категорию Поезд
+    msg_cat = _re.sub(r'\b(поездк\w*|поездок|проехал\w*|съездит\w*|ездил\w*|'
+                      r'покатушк\w*|наездил\w*)\b', ' ', msg)
+    cats = [c for c, (_, syns) in TRACK_CATS.items() if any(s in msg_cat for s in syns)]
     if cats:
         sel = [t for t in sel if t.get('c') in cats]
         desc.append('категория ' + '/'.join(TRACK_CATS[c][0] for c in cats))
@@ -174,13 +178,28 @@ def tracks_context(message):
         desc.append('год ' + '/'.join(map(str, years)))
     # слова-подстроки для поиска по именам (латиница и «содержательные» русские)
     stop = {'сколько', 'какой', 'какая', 'какие', 'когда', 'где', 'самый', 'самая',
-            'всего', 'проехала', 'проехал', 'ездила', 'ездил', 'была', 'быть',
-            'треки', 'трек', 'поездки', 'поездка', 'этом', 'году', 'меня', 'мной'}
+            'самое', 'всего', 'итого', 'проехала', 'проехал', 'проехали', 'ездила',
+            'ездил', 'ездили', 'наездила', 'намотала', 'намотал', 'была', 'был',
+            'были', 'быть', 'треки', 'трек', 'треков', 'поездки', 'поездка',
+            'поездок', 'этом', 'году', 'год', 'года', 'меня', 'мной', 'мои', 'моих',
+            'моя', 'мой', 'что', 'как', 'для', 'при', 'над', 'под', 'про', 'это',
+            'вообще', 'примерно', 'общая', 'общий', 'сумма', 'километр', 'километров',
+            'километра', 'покажи', 'скажи', 'посчитай', 'дистанция', 'пробег'}
+    # бренды/названия, которые пишут по-русски → как они лежат в именах треков
+    ALIAS = {'mixwheels': ('миксвилс', 'миксвилз', 'миксвилc', 'миксвил', 'mixwheels'),
+             'flystation': ('флайстейшн', 'flystation'),
+             'narvaman': ('нарваман', 'narvaman')}
+    for canon, forms in ALIAS.items():
+        if any(f in msg for f in forms):
+            msg = msg + ' ' + canon
+            message = message + ' ' + canon
     used = {s for c in cats for s in TRACK_CATS[c][1]}
     words = []
-    for w in _re.findall(r'[a-zA-Zа-яёА-ЯЁ][\w-]{2,}', message):
+    for w in _re.findall(r'[a-zA-Zа-яёА-ЯЁ][\w-]{3,}', message):
         wl = w.lower()
         if wl in stop or any(wl.startswith(u) or u.startswith(wl) for u in used):
+            continue
+        if wl in words:
             continue
         words.append(wl)
     name_hits = []
@@ -200,8 +219,16 @@ def tracks_context(message):
             y_sel.setdefault(t.get('y'), [0, 0.0])
             y_sel[t.get('y')][0] += 1
             y_sel[t.get('y')][1] += t.get('km') or 0
-        lines.append('ГОТОВЫЙ ФАКТ (использовать как ответ): по фильтру «%s» — '
-                     '%d трек(ов), суммарно %.1f км.' % ('; '.join(desc), len(sel), km_sel))
+        human = []
+        if cats:
+            human.append('/'.join(TRACK_CATS[c][0] for c in cats))
+        if name_hits and words:
+            human.append('«' + ' '.join(words[:4]) + '»')
+        if years:
+            human.append('за ' + '/'.join(map(str, years)))
+        lines.append('ФАКТ ДЛЯ ОТВЕТА (числа брать отсюда, своими словами): %s — '
+                     '%d поездок, %.0f км.' %
+                     (' '.join(human) or 'по вашему запросу', len(sel), km_sel))
         if len(y_sel) > 1:
             lines.append('Из них по годам: ' + '; '.join(
                 f'{y}: {n} шт, {km:.0f} км' for y, (n, km) in sorted(y_sel.items()) if y))
@@ -342,9 +369,9 @@ def chat():
         raw = ask_llm(system, history, message)
     except Exception:
         # модель лежит, но точный факт уже посчитан кодом — отдаём его напрямую
-        fact = next((l for l in tr_ctx.split('\n') if l.startswith('ГОТОВЫЙ ФАКТ')), '')
+        fact = next((l for l in tr_ctx.split('\n') if l.startswith('ФАКТ ДЛЯ ОТВЕТА')), '')
         if fact:
-            return jsonify({'answer': fact.replace('ГОТОВЫЙ ФАКТ (использовать как ответ): ', '')})
+            return jsonify({'answer': fact.replace('ФАКТ ДЛЯ ОТВЕТА (числа брать отсюда, своими словами): ', '')})
         return jsonify({'error': 'Помощник сейчас недоступен, попробуйте позже.'}), 503
 
     try:
